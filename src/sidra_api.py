@@ -1,16 +1,17 @@
 """
-Integração com API do SIDRA/IBGE - Versão Corrigida
+Integração com API do SIDRA/IBGE - Versão Corrigida com Formatação de Colunas
 """
 import requests
 import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import json
 import re
+from io import StringIO
 from .config import Config
 from .utils import logger, retry_on_failure
 
 class SidraAPI:
-    """Cliente para API do SIDRA - Versão Corrigida"""
+    """Cliente para API do SIDRA - Versão com formatação de colunas"""
     
     def __init__(self):
         self.base_url = "https://sidra.ibge.gov.br"
@@ -181,9 +182,48 @@ class SidraAPI:
              "descricao": "Indicadores de construção civil"},
         ]
     
+    def _formatar_dados_para_csv(self, dados_json: list) -> str:
+        """
+        Formata os dados do SIDRA em CSV com colunas organizadas
+        
+        Args:
+            dados_json: Dados no formato JSON retornado pela API
+            
+        Returns:
+            String formatada em CSV
+        """
+        try:
+            if not dados_json or len(dados_json) < 2:
+                return ""
+            
+            # Primeira linha contém os cabeçalhos
+            cabecalhos = dados_json[0]
+            
+            # Demais linhas são os dados
+            dados = dados_json[1:]
+            
+            # Criar DataFrame
+            df = pd.DataFrame(dados, columns=cabecalhos)
+            
+            # Limpar nomes das colunas
+            df.columns = [str(col).strip().replace('"', '').replace('\n', ' ') for col in df.columns]
+            
+            # Converter para CSV
+            output = StringIO()
+            df.to_csv(output, index=False, encoding='utf-8-sig', sep=';')
+            csv_string = output.getvalue()
+            output.close()
+            
+            return csv_string
+            
+        except Exception as e:
+            logger.error(f"Erro ao formatar dados para CSV: {str(e)}")
+            # Fallback: retornar os dados originais
+            return dados_json
+    
     def baixar_tabela(self, codigo: str, formato: str = "csv") -> Tuple[Optional[str], Optional[bytes]]:
         """
-        Baixa dados de uma tabela específica
+        Baixa dados de uma tabela específica e formata em colunas
         
         Args:
             codigo: Código da tabela
@@ -193,41 +233,73 @@ class SidraAPI:
             Tuple (filename, dados_em_bytes)
         """
         try:
-            # URLs corrigidas da API do SIDRA
-            if formato == "csv":
-                url = f"{self.api_url}/values/t/{codigo}/n1/all/v/all/p/last%201"
-                filename = f"tabela_{codigo}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            elif formato == "json":
-                url = f"{self.api_url}/values/t/{codigo}/n1/all/v/all/p/last%201?formato=json"
-                filename = f"tabela_{codigo}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json"
-            else:
-                raise ValueError(f"Formato não suportado: {formato}")
+            # Sempre buscar em JSON primeiro para formatar
+            url_json = f"{self.api_url}/values/t/{codigo}/n1/all/v/all/p/last%201?formato=json"
             
-            logger.info(f"Baixando de: {url}")
+            logger.info(f"Baixando dados da tabela {codigo}")
             
-            response = self.session.get(url, timeout=Config.TIMEOUT, verify=False)
-            response.raise_for_status()
+            response = self.session.get(url_json, timeout=Config.TIMEOUT, verify=False)
             
-            if response.status_code == 200:
-                if formato == "json":
-                    dados = response.content
-                else:
-                    # Para CSV, garantir que está em utf-8
-                    dados = response.content
-                
-                logger.info(f"Tabela {codigo} baixada com sucesso em {formato}")
-                return filename, dados
-            else:
+            if response.status_code != 200:
                 logger.error(f"Falha no download: Status {response.status_code}")
                 return None, None
+            
+            dados_json = response.json()
+            
+            # Verificar se os dados são válidos
+            if not dados_json or len(dados_json) < 2:
+                raise Exception("Dados retornados estão vazios ou em formato inválido")
+            
+            if formato == "json":
+                # Para JSON, manter formato original mas organizado
+                df = self._converter_para_dataframe(dados_json)
+                json_output = df.to_json(orient='records', force_ascii=False, indent=2)
+                filename = f"tabela_{codigo}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json"
+                return filename, json_output.encode('utf-8')
+                
+            else:  # CSV formatado
+                csv_string = self._formatar_dados_para_csv(dados_json)
+                filename = f"tabela_{codigo}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                return filename, csv_string.encode('utf-8-sig')
             
         except Exception as e:
             logger.error(f"Erro ao baixar tabela {codigo}: {str(e)}")
             raise Exception(f"Erro no download: {str(e)}. Verifique se o código da tabela está correto.")
     
+    def _converter_para_dataframe(self, dados_json: list) -> pd.DataFrame:
+        """
+        Converte dados JSON do SIDRA para DataFrame organizado
+        
+        Args:
+            dados_json: Dados no formato da API do SIDRA
+            
+        Returns:
+            DataFrame estruturado
+        """
+        if not dados_json or len(dados_json) < 2:
+            return pd.DataFrame()
+        
+        cabecalhos = dados_json[0]
+        dados = dados_json[1:]
+        
+        df = pd.DataFrame(dados, columns=cabecalhos)
+        
+        # Limpar nomes das colunas
+        df.columns = [str(col).strip().replace('"', '').replace('\n', ' ') for col in df.columns]
+        
+        # Tentar converter colunas numéricas
+        for col in df.columns:
+            try:
+                if col not in ['Variável', 'Categoria', 'Nível Territorial', 'Território']:
+                    df[col] = pd.to_numeric(df[col], errors='ignore')
+            except:
+                pass
+        
+        return df
+    
     def preview_tabela(self, codigo: str, n_rows: int = 10) -> Optional[pd.DataFrame]:
         """
-        Obtém preview dos dados da tabela
+        Obtém preview dos dados da tabela já formatado em colunas
         
         Args:
             codigo: Código da tabela
@@ -242,12 +314,12 @@ class SidraAPI:
             response.raise_for_status()
             
             if response.status_code == 200:
-                dados = response.json()
-                if isinstance(dados, list) and len(dados) > 1:
-                    cabecalho = dados[0]
-                    valores = dados[1:n_rows+1]
-                    df = pd.DataFrame(valores, columns=cabecalho)
-                    return df
+                dados_json = response.json()
+                df = self._converter_para_dataframe(dados_json)
+                
+                if not df.empty:
+                    return df.head(n_rows)
+            
             return None
             
         except Exception as e:
